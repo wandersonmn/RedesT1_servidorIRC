@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+import asyncio
+from tcp import Servidor
+import re
+buffer = b''
+
+dici_nicks = {} #dicionario com nicks
+dici_nicksu = {} #dicionário em Uppercase
+dici_canais = {} #dicionario de canais
+        
+    
+def inserir_nick(conexao,nick):
+    global dici_nicks
+    global dici_nicksu
+    
+    dici_nicks[conexao] = nick
+    dici_nicksu[conexao] = nick.upper()
+    conexao.enviar(b':server 001 %s :Welcome\r\n' %nick)
+    conexao.enviar(b':server 422 %s :MOTD File is missing\r\n' %nick)
+
+def inserir_nick_novo(conexao, nick, newnick):
+    global dici_nicks
+    global dici_nicksu
+    
+    dici_nicks[conexao] = newnick
+    dici_nicksu[conexao] = newnick.upper()
+    conexao.enviar(b':%s NICK %s\r\n' % (nick, newnick))
+
+def informa_entrada_canal(canal,nick):
+    global dici_canais
+    for i in range(len(dici_canais[canal])):
+        conexao = busca_por_nick((dici_canais[canal][i]).upper())
+        conexao.enviar(b':%s JOIN :#%s\r\n' % (nick, canal))
+   
+def entrar_no_canal(canal, nick):
+    if canal in dici_canais.keys():
+        dici_canais[canal].append(nick)
+    else:
+        dici_canais[canal] = [nick]
+    
+def sair_do_canal(canal,nick):
+    global dici_nicks
+   
+    for i in range(len(dici_canais[canal])):
+        conexao = busca_por_nick(dici_canais[canal][i].upper())
+        conexao.enviar(b':%s PART #%s\r\n' %(nick,canal))
+    dici_canais[canal].remove(nick)
+
+def busca_por_nick(nick):
+    for conexao, lnick in dici_nicksu.items():
+        if lnick == nick:
+            return conexao
+
+def validar_nome(nome):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+def informa_saida_servidor(conexao):
+    global dici_canais
+    global dici_nicksu
+    nick = dici_nicks[conexao]
+    dici_nicks.pop(conexao)
+    dici_nicksu.pop(conexao)
+    for canal in dici_canais.keys():
+        if nick in dici_canais[canal]:
+            dici_canais[canal].remove(nick)
+            for i in range(len(dici_canais[canal])):
+                conexao2 = busca_por_nick(dici_canais[canal][i].upper())
+                conexao2.enviar(b':%s QUIT :Connection closed\r\n' %nick)
+
+def sair(conexao):
+    informa_saida_servidor(conexao)
+    print(conexao, 'conexão fechada')
+    conexao.fechar()
+
+
+def dados_recebidos(conexao, dados):
+    global buffer
+    global dici_nicks
+    global dici_nicksu
+    
+    dados = buffer +dados
+    if dados == b'':
+        return sair(conexao)
+        
+    dadosParciais = dados.split(b'\n')
+    
+    if dados.endswith(b'\n'):
+        buffer = b''
+    else:
+        buffer = dadosParciais[len(dadosParciais) -1]
+        
+    for x in range(len(dadosParciais) -1):
+        if dadosParciais[x] == b'':
+           return sair(conexao)
+        dadosParciais[x] += b'\n'
+        #envio de mensagem
+        if dadosParciais[x].startswith(b'PRIVMSG'):
+            destinatario = dadosParciais[x].split(b' ')[1]
+            
+            mensagem = dadosParciais[x].split(b' :',1)[1]
+            #mensagem privada para 1 usuario
+            if destinatario.upper() in dici_nicksu.values():
+                conexao2 = busca_por_nick(destinatario.upper())
+                conexao2.enviar(b':%s PRIVMSG %s :%s' %(dici_nicks[conexao], destinatario,mensagem))
+                
+            #mensagem para um canal
+            if destinatario.startswith(b'#'):
+                destinatario = dadosParciais[x].split(b' #')[1]
+                destinatario = destinatario.split(b' :',1)[0]
+                dest = destinatario.lower()
+                
+                for i in range(len(dici_canais[dest])):
+                    conexao2 = busca_por_nick((dici_canais[dest][i]).upper()) 
+                    if conexao != conexao2:
+                        conexao2.enviar(b':%s PRIVMSG #%s :%s' % (dici_nicks[conexao], destinatario, mensagem))
+                        
+        #entra em um canal
+        if dadosParciais[x].startswith(b'JOIN'):
+            canal = dadosParciais[x].split(b' #',1)[1]
+            canal = canal.split(b'\r')[0]
+            canal = canal.lower()
+            
+            if validar_nome(canal):
+                entrar_no_canal(canal, dici_nicks[conexao]) 
+                informa_entrada_canal(canal,dici_nicks[conexao])
+                
+                conexao.enviar(b':server 353 %s = #%s :%s\n' %(dici_nicks[conexao], canal, b' '.join(sorted(dici_canais[canal]))))
+                conexao.enviar(b':server 366 %s #%s :End of /NAMES list.\r\n' % (dici_nicks[conexao], canal))
+                
+            else:
+                conexao.enviar(b':server 403 %s :No such channel\r\n' %canal)
+        #sair de um canal
+        if dadosParciais[x].startswith(b'PART'):
+            canal = dadosParciais[x].split(b' ',2)[1]
+            canal = canal.split(b'\r')[0]
+            canal = canal.rsplit(b'#')[1]
+            canal = canal.lower()
+            
+            sair_do_canal(canal, dici_nicks[conexao])
+            
+        #registro de apelido NICK
+        if dadosParciais[x].startswith(b'NICK'):
+            nick = dadosParciais[x].split(b' ',1)[1]
+            nick = nick.split(b'\r')[0]
+            
+            if validar_nome(nick):
+                if conexao in dici_nicks.keys():
+                    
+                    if nick in dici_nicks.values():
+                        conexao.enviar(b':server 433 %s %s :Nickname is already in use\r\n' %(dici_nicks[conexao],nick))
+                    elif nick.upper() in dici_nicksu.values():
+                        conexao.enviar(b':server 433 %s %s :Nickname is already in use\r\n' %(dici_nicks[conexao], nick))
+                    else:
+                        inserir_nick_novo(conexao, dici_nicks[conexao],nick)
+                else:
+                    if nick in dici_nicks.values():
+                        conexao.enviar(b':server 433 * %s :Nickname is already in use\r\n' %nick) 
+                    elif nick.upper() in dici_nicksu.values():
+                        conexao.enviar(b':server 433 %s %s :Nickname is already in use\r\n' %(dici_nicks[conexao], nick))
+                    else:
+                        inserir_nick(conexao, nick)
+            else:
+                conexao.enviar(b':server 432 * %s :Erroneous nickname\r\n' %nick)
+               
+        #Resposta de PING do servidor
+        if dadosParciais[x].startswith(b'PING'):
+            conexao.enviar(b':server PONG server :' + dadosParciais[x].split(b' ',1)[1])
+        print(conexao, dadosParciais[x])
+    
+def conexao_aceita(conexao):
+    print(conexao, 'nova conexão')
+    conexao.registrar_recebedor(dados_recebidos)
+
+
+servidor = Servidor(6667)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+asyncio.get_event_loop().run_forever()
